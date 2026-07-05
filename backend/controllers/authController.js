@@ -15,7 +15,8 @@ const DASHBOARD_PATHS = {
     VENDOR: '/dashboard/vendor',
     COLLEGE: '/dashboard/college',
     MENTOR: '/dashboard/mentor',
-    STUDENT: '/dashboard/student'
+    STUDENT: '/dashboard/student',
+    NON_STUDENT: '/dashboard/student'
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -45,7 +46,7 @@ exports.listDepartments = async (req, res) => {
 
     try {
         const [departments] = await db.execute(
-            'SELECT id, college_id, name FROM departments WHERE college_id = ? ORDER BY name ASC',
+            'SELECT id, college_id, department_name AS name FROM departments WHERE college_id = ? ORDER BY department_name ASC',
             [parseInt(college_id)]
         );
         return res.status(200).json({ departments });
@@ -63,7 +64,7 @@ const dispatchRegistrationOtp = async (cleanEmail, displayName) => {
     const expiry = new Date(Date.now() + 5 * 60 * 1000);
 
     await db.execute(
-        'INSERT INTO otp_verification (email, otp, purpose, expiry) VALUES (?, ?, "REGISTER", ?)',
+        'INSERT INTO otp_verifications (email, otp_code, purpose, expires_at) VALUES (?, ?, "REGISTER", ?)',
         [cleanEmail, otp, expiry]
     );
 
@@ -142,45 +143,34 @@ exports.registerStudent = async (req, res) => {
 
         const hashedPassword = await bcrypt.hash(password, 12);
         const username = cleanEmail.split('@')[0];
+        const businessUserId = 'USR-' + new Date().getFullYear() + '-' + Math.floor(100000 + Math.random() * 900000);
+        const roleId = college_id ? '7' : '9'; // 7 = COLLEGE_STUDENT, 9 = DIRECT_STUDENT
 
         const [userResult] = await db.execute(
-            'INSERT INTO users (username, email, password, role, is_verified, status) VALUES (?, ?, ?, "STUDENT", 0, "PENDING")',
-            [username, cleanEmail, hashedPassword]
+            'INSERT INTO users (user_id, username, email, password, role_id, phone, is_verified, status) VALUES (?, ?, ?, ?, ?, ?, 0, "PENDING")',
+            [businessUserId, username, cleanEmail, hashedPassword, roleId, mobile]
         );
         const userId = userResult.insertId;
 
-        // ── LEGACY MAPPING LOGIC (UNTOUCHED) ──────────────────────────
-        // Preserved exactly as it existed before, only re-sourced from
-        // the corrected field names above (college_id, degree,
-        // year_of_study, semester) instead of the old (college, course,
-        // year, semester) names, since those old names no longer exist
-        // in the incoming payload.
-        const mappedCollegeId = isNaN(college_id) ? 1 : parseInt(college_id);
-        const mappedYearId = isNaN(year_of_study) ? 1 : parseInt(year_of_study);
-        const mappedSemesterId = isNaN(semester) ? 1 : parseInt(semester);
-
-        let mappedCourseId = 1;
-        if (degree === 'mca') mappedCourseId = 1;
-        if (degree === 'be') mappedCourseId = 2;
-        // ── END LEGACY MAPPING LOGIC ───────────────────────────────────
-
-        const mappedDepartmentId = department_id && !isNaN(department_id)
-            ? parseInt(department_id)
-            : null;
+        const mappedCollegeId = college_id && !isNaN(college_id) ? parseInt(college_id) : null;
+        const mappedDepartmentId = department_id && !isNaN(department_id) ? parseInt(department_id) : null;
+        const mappedYearOfStudy = year_of_study && !isNaN(year_of_study) ? parseInt(year_of_study) : null;
+        const originType = college_id ? 'COLLEGE' : 'DIRECT';
 
         await db.execute(
-            'INSERT INTO students (user_id, roll_no, student_name, mobile, college_profile_id, course_id, year_id, semester_id, degree, department_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'INSERT INTO student_profiles (id, user_id, role_id, student_name, roll_no, mobile, college_id, department_id, year_of_study, origin_type, added_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [
                 userId,
-                roll_no || null,
+                businessUserId,
+                roleId,
                 full_name,
+                roll_no || '',
                 mobile,
                 mappedCollegeId,
-                mappedCourseId,
-                mappedYearId,
-                mappedSemesterId,
-                degree || null,
-                mappedDepartmentId
+                mappedDepartmentId,
+                mappedYearOfStudy,
+                originType,
+                businessUserId // self-registered
             ]
         );
 
@@ -221,16 +211,18 @@ exports.registerNonStudent = async (req, res) => {
 
         const hashedPassword = await bcrypt.hash(password, 12);
         const username = cleanEmail.split('@')[0];
+        const businessUserId = 'USR-' + new Date().getFullYear() + '-' + Math.floor(100000 + Math.random() * 900000);
+        const roleId = '10'; // 10 = DIRECT_USER / NON_STUDENT
 
         const [userResult] = await db.execute(
-            'INSERT INTO users (username, email, password, role, is_verified, status) VALUES (?, ?, ?, "NON_STUDENT", 0, "PENDING")',
-            [username, cleanEmail, hashedPassword]
+            'INSERT INTO users (user_id, username, email, password, role_id, phone, is_verified, status) VALUES (?, ?, ?, ?, ?, ?, 0, "PENDING")',
+            [businessUserId, username, cleanEmail, hashedPassword, roleId, mobile]
         );
         const userId = userResult.insertId;
 
         await db.execute(
-            'INSERT INTO non_students (user_id, full_name, mobile) VALUES (?, ?, ?)',
-            [userId, full_name, mobile]
+            'INSERT INTO non_student_profiles (id, user_id, role_id, full_name, mobile) VALUES (?, ?, ?, ?, ?)',
+            [userId, businessUserId, roleId, full_name, mobile]
         );
 
         await dispatchRegistrationOtp(cleanEmail, full_name);
@@ -255,7 +247,7 @@ exports.verifyOtp = async (req, res) => {
     try {
         const cleanEmail = email.trim().toLowerCase();
         const [records] = await db.execute(
-            'SELECT * FROM otp_verification WHERE email = ? AND otp = ? AND purpose = ? AND is_used = 0 AND expiry > NOW()',
+            'SELECT * FROM otp_verifications WHERE email = ? AND otp_code = ? AND purpose = ? AND is_used = 0 AND expires_at > NOW()',
             [cleanEmail, otp, purpose]
         );
 
@@ -263,7 +255,7 @@ exports.verifyOtp = async (req, res) => {
             return res.status(400).json({ message: 'Invalid or expired verification code.' });
         }
 
-        await db.execute('UPDATE otp_verification SET is_used = 1 WHERE id = ?', [records[0].id]);
+        await db.execute('UPDATE otp_verifications SET is_used = 1 WHERE id = ?', [records[0].id]);
 
         if (purpose === 'REGISTER') {
             await db.execute('UPDATE users SET is_verified = 1, status = "ACTIVE" WHERE email = ?', [cleanEmail]);
@@ -304,39 +296,48 @@ exports.login = async (req, res) => {
         }
 
         let displayName = user.email;
-        if (user.role === 'SUPER_ADMIN') {
+        let roleName = 'STUDENT';
+
+        if (user.role_id === '1') {
+            roleName = 'SUPER_ADMIN';
             displayName = 'Super Admin';
-        } else if (user.role === 'ADMIN') {
-            const [r] = await db.execute('SELECT admin_name FROM admins WHERE user_id = ?', [user.id]);
+        } else if (user.role_id === '2') {
+            roleName = 'ADMIN';
+            const [r] = await db.execute('SELECT admin_name FROM admin_profiles WHERE id = ?', [user.id]);
             if (r.length) displayName = r[0].admin_name;
-        } else if (user.role === 'VENDOR') {
-            const [r] = await db.execute('SELECT vendor_name FROM vendors WHERE user_id = ?', [user.id]);
-            if (r.length) displayName = r[0].vendor_name;
-        } else if (user.role === 'COLLEGE') {
-            const [r] = await db.execute('SELECT college_name FROM colleges WHERE user_id = ?', [user.id]);
+        } else if (user.role_id === '3') {
+            roleName = 'COLLEGE';
+            const [r] = await db.execute('SELECT college_name FROM colleges WHERE user_id = ?', [user.user_id]);
             if (r.length) displayName = r[0].college_name;
-        } else if (user.role === 'MENTOR') {
-            const [r] = await db.execute('SELECT mentor_name FROM mentors WHERE user_id = ?', [user.id]);
+        } else if (user.role_id === '4' || user.role_id === '6') {
+            roleName = 'MENTOR';
+            const [r] = await db.execute('SELECT mentor_name FROM mentor_profiles WHERE id = ?', [user.id]);
             if (r.length) displayName = r[0].mentor_name;
-        } else if (user.role === 'STUDENT') {
-            const [r] = await db.execute('SELECT student_name FROM students WHERE user_id = ?', [user.id]);
+        } else if (user.role_id === '5') {
+            roleName = 'VENDOR';
+            const [r] = await db.execute('SELECT vendor_name FROM vendor_profiles WHERE id = ?', [user.id]);
+            if (r.length) displayName = r[0].vendor_name;
+        } else if (user.role_id === '7' || user.role_id === '8' || user.role_id === '9') {
+            roleName = 'STUDENT';
+            const [r] = await db.execute('SELECT student_name FROM student_profiles WHERE id = ?', [user.id]);
             if (r.length) displayName = r[0].student_name;
-        } else if (user.role === 'NON_STUDENT') {
-            const [r] = await db.execute('SELECT full_name FROM non_students WHERE user_id = ?', [user.id]);
+        } else if (user.role_id === '10') {
+            roleName = 'NON_STUDENT';
+            const [r] = await db.execute('SELECT full_name FROM non_student_profiles WHERE id = ?', [user.id]);
             if (r.length) displayName = r[0].full_name;
         }
 
         const accessToken = jwt.sign(
-            { id: user.id, role: user.role.toUpperCase(), name: displayName, email: user.email },
+            { id: user.id, role: roleName, name: displayName, email: user.email },
             JWT_SECRET,
             { expiresIn: JWT_EXPIRES }
         );
 
         return res.status(200).json({
             accessToken,
-            role: user.role.toUpperCase(),
-            dashboard: DASHBOARD_PATHS[user.role.toUpperCase()] || '/auth/login',
-            user: { id: user.id, username: user.username, email: user.email, role: user.role.toUpperCase(), name: displayName }
+            role: roleName,
+            dashboard: DASHBOARD_PATHS[roleName] || '/auth/login',
+            user: { id: user.id, username: user.username, email: user.email, role: roleName, name: displayName }
         });
     } catch (err) {
         return res.status(500).json({ message: 'An internal server error occurred during login.', error: err.message });
@@ -375,7 +376,7 @@ exports.forgotPassword = async (req, res) => {
         const expiry = new Date(Date.now() + 5 * 60 * 1000);
 
         await db.execute(
-            'INSERT INTO otp_verification (email, otp, purpose, expiry) VALUES (?, ?, "FORGOT_PASSWORD", ?)',
+            'INSERT INTO otp_verifications (email, otp_code, purpose, expires_at) VALUES (?, ?, "FORGOT_PASSWORD", ?)',
             [cleanEmail, otp, expiry]
         );
 
@@ -407,7 +408,7 @@ exports.resetPassword = async (req, res) => {
     try {
         const cleanEmail = email.trim().toLowerCase();
         const [records] = await db.execute(
-            'SELECT * FROM otp_verification WHERE email = ? AND otp = ? AND purpose = "FORGOT_PASSWORD" AND is_used = 0 AND expiry > NOW()',
+            'SELECT * FROM otp_verifications WHERE email = ? AND otp_code = ? AND purpose = "FORGOT_PASSWORD" AND is_used = 0 AND expires_at > NOW()',
             [cleanEmail, otp]
         );
         if (!records.length) {
@@ -425,7 +426,7 @@ exports.resetPassword = async (req, res) => {
             'UPDATE users SET password = ?, status = "ACTIVE" WHERE id = ?',
             [hashedPassword, users[0].id]
         );
-        await db.execute('UPDATE otp_verification SET is_used = 1 WHERE id = ?', [records[0].id]);
+        await db.execute('UPDATE otp_verifications SET is_used = 1 WHERE id = ?', [records[0].id]);
 
         return res.status(200).json({ message: 'Password reset successfully. You can now log in.' });
     } catch (err) {
